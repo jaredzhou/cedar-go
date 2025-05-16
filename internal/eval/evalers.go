@@ -8,6 +8,7 @@ import (
 	"github.com/cedar-policy/cedar-go/internal/extensions"
 	"github.com/cedar-policy/cedar-go/internal/mapset"
 	"github.com/cedar-policy/cedar-go/types"
+	"github.com/cedar-policy/cedar-go/x/exp/ast"
 )
 
 var errOverflow = fmt.Errorf("integer overflow")
@@ -30,6 +31,11 @@ type Env struct {
 
 type Evaler interface {
 	Eval(Env) (types.Value, error)
+}
+
+func EvalNode(n ast.IsNode, env Env) (types.Value, error) {
+	evaler := toEval(n)
+	return evaler.Eval(env)
 }
 
 func evalBool(n Evaler, env Env) (types.Boolean, error) {

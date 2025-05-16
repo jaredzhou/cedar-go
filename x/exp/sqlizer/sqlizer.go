@@ -1,0 +1,441 @@
+package sqlizer
+
+import (
+	"bytes"
+	"fmt"
+	"strings"
+
+	"github.com/cedar-policy/cedar-go/internal/eval"
+	"github.com/cedar-policy/cedar-go/types"
+	"github.com/cedar-policy/cedar-go/x/exp/ast"
+)
+
+type FieldMapper interface {
+	Map(name string) (string, bool)
+}
+
+type defaultFieldMapper struct{}
+
+func (m defaultFieldMapper) Map(name string) (string, bool) {
+	return name, true
+}
+
+type Sqlizer interface {
+	ToSql() (string, []interface{}, error)
+}
+
+type expr struct {
+	sql  string
+	args []interface{}
+}
+
+func Expr(sql string, args ...interface{}) Sqlizer {
+	return expr{sql: sql, args: args}
+}
+
+func (e expr) ToSql() (sql string, args []interface{}, err error) {
+	simple := true
+	for _, arg := range e.args {
+		if _, ok := arg.(Sqlizer); ok {
+			simple = false
+		}
+	}
+	if simple {
+		return e.sql, e.args, nil
+	}
+
+	buf := &bytes.Buffer{}
+	ap := e.args
+	sp := e.sql
+
+	var isql string
+	var iargs []interface{}
+
+	for err == nil && len(ap) > 0 && len(sp) > 0 {
+		i := strings.Index(sp, "?")
+		if i < 0 {
+			// no more placeholders
+			break
+		}
+		if len(sp) > i+1 && sp[i+1:i+2] == "?" {
+			// escaped "??"; append it and step past
+			buf.WriteString(sp[:i+2])
+			sp = sp[i+2:]
+			continue
+		}
+
+		if as, ok := ap[0].(Sqlizer); ok {
+			// sqlizer argument; expand it and append the result
+			isql, iargs, err = as.ToSql()
+			buf.WriteString(sp[:i])
+			buf.WriteString(isql)
+			args = append(args, iargs...)
+		} else {
+			// normal argument; append it and the placeholder
+			buf.WriteString(sp[:i+1])
+			args = append(args, ap[0])
+		}
+
+		// step past the argument and placeholder
+		ap = ap[1:]
+		sp = sp[i+1:]
+	}
+
+	// append the remaining sql and arguments
+	buf.WriteString(sp)
+	return buf.String(), append(args, ap...), err
+}
+
+type part struct {
+	pred interface{}
+	args []interface{}
+}
+
+func newPart(pred interface{}, args ...interface{}) part {
+	return part{pred: pred, args: args}
+}
+
+func (p part) ToSql() (sql string, args []interface{}, err error) {
+	switch pred := p.pred.(type) {
+	case nil:
+		// no-op
+	case Sqlizer:
+		sql, args, err = Sqlizer(pred).ToSql()
+	case string:
+		sql = pred
+		args = p.args
+	default:
+		err = fmt.Errorf("expected string or Sqlizer, not %T", pred)
+	}
+	return
+}
+
+type concatExpr []interface{}
+
+func (ce concatExpr) ToSql() (sql string, args []interface{}, err error) {
+	for _, part := range ce {
+		switch p := part.(type) {
+		case string:
+			sql += p
+		case Sqlizer:
+			pSql, pArgs, err := p.ToSql()
+			if err != nil {
+				return "", nil, err
+			}
+			sql += pSql
+			args = append(args, pArgs...)
+		default:
+			return "", nil, fmt.Errorf("%#v is not a string or Sqlizer", part)
+		}
+	}
+	return
+}
+func ConcatExpr(parts ...interface{}) concatExpr {
+	return concatExpr(parts)
+}
+
+func ToSql(node ast.IsNode, env eval.Env, mapper FieldMapper) (sql string, args []interface{}, err error) {
+	isValue, value, sqlizer, err := toSqlOrValue(node, env, mapper)
+	if err != nil {
+		return "", nil, err
+	}
+	if isValue {
+		val, err := ValueToType[types.Boolean](value)
+		if err != nil {
+			return "", nil, err
+		}
+		if val {
+			return "TRUE", nil, nil
+		}
+		return "FALSE", nil, nil
+	}
+	return sqlizer.ToSql()
+}
+
+func toSqlOrValue(node ast.IsNode, env eval.Env, mapper FieldMapper) (isValue bool, value types.Value, sqlizer Sqlizer, err error) {
+	switch n := node.(type) {
+	case ast.NodeTypeAccess:
+		return toAccess(n, env, mapper)
+	case ast.NodeTypeHas:
+		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
+	case ast.NodeTypeGetTag:
+		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
+	case ast.NodeTypeHasTag:
+		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
+	case ast.NodeTypeLike:
+		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
+	case ast.NodeTypeIfThenElse:
+		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
+	case ast.NodeTypeIs:
+		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
+	case ast.NodeTypeIsIn:
+		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
+	case ast.NodeTypeExtensionCall:
+		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
+	case ast.NodeValue:
+		return true, n.Value, nil, nil
+	case ast.NodeTypeRecord:
+		return toValueOrError(n, env, mapper)
+	case ast.NodeTypeSet:
+		return toValueOrError(n, env, mapper)
+	case ast.NodeTypeNegate:
+		return toValueOrError(n, env, mapper)
+	case ast.NodeTypeNot:
+		return toSqlNot(n, env, mapper)
+	case ast.NodeTypeVariable:
+		return toSqlVariable(n, env, mapper)
+	case ast.NodeTypeIn:
+		return toSqlIn(n, env, mapper)
+	case ast.NodeTypeAnd, ast.NodeTypeOr:
+		return toSqlBinary(n, env, mapper)
+	case ast.NodeTypeEquals, ast.NodeTypeNotEquals, ast.NodeTypeGreaterThan, ast.NodeTypeGreaterThanOrEqual, ast.NodeTypeLessThan, ast.NodeTypeLessThanOrEqual:
+		return toSqlBinary(n, env, mapper)
+	case ast.NodeTypeSub, ast.NodeTypeAdd, ast.NodeTypeMult:
+		return toSqlBinary(n, env, mapper)
+	case ast.NodeTypeContains, ast.NodeTypeContainsAll, ast.NodeTypeContainsAny:
+		return toSqlBinary(n, env, mapper)
+	case ast.NodeTypeIsEmpty:
+		return toSqlEmpty(n, env, mapper)
+	default:
+		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
+	}
+}
+
+// getBinaryFields returns the operator and the left and right nodes of a binary node
+func getBinaryFields(node ast.IsNode) (op string, left, right ast.IsNode) {
+	switch n := node.(type) {
+	case ast.NodeTypeAnd:
+		return "AND", n.Left, n.Right
+	case ast.NodeTypeOr:
+		return "OR", n.Left, n.Right
+	case ast.NodeTypeEquals:
+		return "=", n.Left, n.Right
+	case ast.NodeTypeNotEquals:
+		return "!=", n.Left, n.Right
+	case ast.NodeTypeGreaterThan:
+		return ">", n.Left, n.Right
+	case ast.NodeTypeGreaterThanOrEqual:
+		return ">=", n.Left, n.Right
+	case ast.NodeTypeLessThan:
+		return "<", n.Left, n.Right
+	case ast.NodeTypeLessThanOrEqual:
+		return "<=", n.Left, n.Right
+	case ast.NodeTypeAdd:
+		return "+", n.Left, n.Right
+	case ast.NodeTypeSub:
+		return "-", n.Left, n.Right
+	case ast.NodeTypeMult:
+		return "*", n.Left, n.Right
+	case ast.NodeTypeContains:
+		return "@>", n.Left, n.Right
+	case ast.NodeTypeContainsAll:
+		return "@>", n.Left, n.Right
+	case ast.NodeTypeContainsAny:
+		return "?!", n.Left, n.Right
+
+	default:
+		return "", nil, nil
+	}
+}
+
+func toSqlBinary(n ast.IsNode, env eval.Env, mapper FieldMapper) (isValue bool, value types.Value, sqlizer Sqlizer, err error) {
+	op, left, right := getBinaryFields(n)
+	leftIsValue, leftValue, leftSqlizer, err := toSqlOrValue(left, env, mapper)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	rightIsValue, rightValue, rightSqlizer, err := toSqlOrValue(right, env, mapper)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	switch {
+	case leftIsValue && rightIsValue:
+		val, err := eval.EvalNode(n, env)
+		if err != nil {
+			return false, nil, nil, err
+		}
+		return true, val, nil, nil
+	case leftIsValue:
+		valToArg, err := valueToArg(leftValue)
+		if err != nil {
+			return false, nil, nil, err
+		}
+		if _, ok := leftValue.(types.EntityUID); ok {
+			if _, lok := right.(ast.NodeTypeVariable); lok {
+				sql := Expr("? "+op+" ?.id", leftSqlizer, valToArg)
+				return false, nil, sql, nil
+			}
+			sql := Expr("? "+op+" ?", valToArg, rightSqlizer)
+			return false, nil, sql, nil
+		}
+		sql := Expr("? "+op+" ?", valToArg, rightSqlizer)
+		return false, nil, sql, nil
+	case rightIsValue:
+		valToArg, err := valueToArg(rightValue)
+		if err != nil {
+			return false, nil, nil, err
+		}
+		if _, ok := rightValue.(types.EntityUID); ok {
+			if _, lok := left.(ast.NodeTypeVariable); lok {
+				sql := Expr("?.id "+op+" ?", leftSqlizer, valToArg)
+				return false, nil, sql, nil
+			}
+			sql := Expr("? "+op+" ?", leftSqlizer, valToArg)
+			return false, nil, sql, nil
+		}
+		sql := Expr("? "+op+" ?", leftSqlizer, valToArg)
+		return false, nil, sql, nil
+	default:
+		sql := Expr("? "+op+" ?", leftSqlizer, rightSqlizer)
+		return false, nil, sql, nil
+	}
+}
+
+func toAccess(n ast.NodeTypeAccess, env eval.Env, mapper FieldMapper) (isValue bool, value types.Value, sqlizer Sqlizer, err error) {
+	isValue, value, sqlizer, err = toSqlOrValue(n.Arg, env, mapper)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	if isValue {
+		val, err := eval.EvalNode(ast.Value(value).Access(n.Value).AsIsNode(), env)
+		if err != nil {
+			return false, nil, nil, err
+		}
+		return true, val, nil, nil
+	}
+	sql, args, err := sqlizer.ToSql()
+	if err != nil {
+		return false, nil, nil, err
+	}
+	sql = fmt.Sprintf("%s.%s", sql, n.Value)
+	if mapper != nil {
+		field, ok := mapper.Map(sql)
+		if ok {
+			sql = field
+		}
+	}
+	return false, nil, newPart(sql, args...), nil
+}
+
+func toValueOrError(n ast.IsNode, env eval.Env, mapper FieldMapper) (isValue bool, value types.Value, sqlizer Sqlizer, err error) {
+	val, err := eval.EvalNode(n, env)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	return true, val, nil, nil
+}
+
+func toSqlNot(n ast.NodeTypeNot, env eval.Env, mapper FieldMapper) (isValue bool, value types.Value, sqlizer Sqlizer, err error) {
+	isValue, value, sqlizer, err = toSqlOrValue(n.Arg, env, mapper)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	if isValue {
+		val, err := eval.EvalNode(ast.Not(ast.Value(value)).AsIsNode(), env)
+		if err != nil {
+			return false, nil, nil, err
+		}
+		return true, val, nil, nil
+	}
+	return false, nil, Expr("NOT (?)", sqlizer), nil
+}
+
+func toSqlEmpty(n ast.NodeTypeIsEmpty, env eval.Env, mapper FieldMapper) (isValue bool, value types.Value, sqlizer Sqlizer, err error) {
+	isValue, value, sqlizer, err = toSqlOrValue(n.Arg, env, mapper)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	if isValue {
+		val, err := eval.EvalNode(ast.Value(value).IsEmpty().AsIsNode(), env)
+		if err != nil {
+			return false, nil, nil, err
+		}
+		return true, val, nil, nil
+	}
+	return false, nil, Expr("? IS NULL", sqlizer), nil
+}
+
+func toSqlVariable(n ast.NodeTypeVariable, env eval.Env, mapper FieldMapper) (isValue bool, value types.Value, sqlizer Sqlizer, err error) {
+	val, err := eval.EvalNode(n, env)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	if !eval.IsVariable(val) {
+		return true, val, nil, nil
+	}
+	return false, nil, newPart(n.Name.String()), nil
+}
+
+func toSqlIn(n ast.NodeTypeIn, env eval.Env, mapper FieldMapper) (isValue bool, value types.Value, sqlizer Sqlizer, err error) {
+	leftIsValue, leftValue, leftSqlizer, err := toSqlOrValue(n.Left, env, mapper)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	rightIsValue, rightValue, rightSqlizer, err := toSqlOrValue(n.Right, env, mapper)
+	if err != nil {
+		return false, nil, nil, err
+	}
+
+	//两边都是值
+	if leftIsValue && rightIsValue {
+		val, err := eval.EvalNode(ast.Value(leftValue).In(ast.Value(rightValue)).AsIsNode(), env)
+		if err != nil {
+			return false, nil, nil, err
+		}
+		return true, val, nil, nil
+	}
+	//右边是值, 并且只能是set
+	if !rightIsValue {
+		return false, nil, nil, fmt.Errorf("right side of IN must be a set, not %T", rightSqlizer)
+	}
+	if _, err := ValueToType[types.Set](rightValue); err != nil {
+		return false, nil, nil, err
+	}
+	rightArg, err := valueToArg(rightValue)
+	if err != nil {
+		return false, nil, nil, err
+	}
+	expr := Expr("? IN ?", leftSqlizer, rightArg)
+	return false, nil, expr, nil
+}
+
+func valueToArg(v types.Value) (interface{}, error) {
+	switch v := v.(type) {
+	case types.String:
+		return string(v), nil
+	case types.EntityUID:
+		return string(v.ID), nil
+	case types.Long:
+		return int64(v), nil
+	case types.Boolean:
+		return bool(v), nil
+	case types.Decimal:
+		return v.String(), nil
+	case types.Datetime:
+		return v.Time(), nil
+	case types.IPAddr:
+		return nil, fmt.Errorf("unsupported value type for SQL: %T", v)
+	case types.Set:
+		var args []interface{}
+		for item := range v.All() {
+			arg, err := valueToArg(item)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, arg)
+		}
+		return args, nil
+	case types.Record:
+		return nil, fmt.Errorf("unsupported value type for SQL: %T", v)
+	}
+	return nil, fmt.Errorf("%w: expected string, got %v", eval.ErrType, eval.TypeName(v))
+}
+
+func ValueToType[T types.Value](v types.Value) (T, error) {
+	var zero T
+	vv, ok := v.(T)
+	if !ok {
+		return zero, fmt.Errorf("%w: expected %T, got %v", eval.ErrType, zero, eval.TypeName(v))
+	}
+	return vv, nil
+}
