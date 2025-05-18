@@ -117,6 +117,8 @@ func (ce concatExpr) ToSql() (sql string, args []interface{}, err error) {
 		switch p := part.(type) {
 		case string:
 			sql += p
+		case types.String:
+			sql += string(p)
 		case Sqlizer:
 			pSql, pArgs, err := p.ToSql()
 			if err != nil {
@@ -125,7 +127,7 @@ func (ce concatExpr) ToSql() (sql string, args []interface{}, err error) {
 			sql += pSql
 			args = append(args, pArgs...)
 		default:
-			return "", nil, fmt.Errorf("%#v is not a string or Sqlizer", part)
+			return "", nil, fmt.Errorf("%#v is not a string or Sqlizer: %T", part, part)
 		}
 	}
 	return
@@ -156,30 +158,8 @@ func toSqlOrValue(node ast.IsNode, env eval.Env, mapper FieldMapper) (isValue bo
 	switch n := node.(type) {
 	case ast.NodeTypeAccess:
 		return toAccess(n, env, mapper)
-	case ast.NodeTypeHas:
-		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
-	case ast.NodeTypeGetTag:
-		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
-	case ast.NodeTypeHasTag:
-		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
-	case ast.NodeTypeLike:
-		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
-	case ast.NodeTypeIfThenElse:
-		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
-	case ast.NodeTypeIs:
-		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
-	case ast.NodeTypeIsIn:
-		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
-	case ast.NodeTypeExtensionCall:
-		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
 	case ast.NodeValue:
 		return true, n.Value, nil, nil
-	case ast.NodeTypeRecord:
-		return toValueOrError(n, env, mapper)
-	case ast.NodeTypeSet:
-		return toValueOrError(n, env, mapper)
-	case ast.NodeTypeNegate:
-		return toValueOrError(n, env, mapper)
 	case ast.NodeTypeNot:
 		return toSqlNot(n, env, mapper)
 	case ast.NodeTypeVariable:
@@ -196,6 +176,10 @@ func toSqlOrValue(node ast.IsNode, env eval.Env, mapper FieldMapper) (isValue bo
 		return toSqlBinary(n, env, mapper)
 	case ast.NodeTypeIsEmpty:
 		return toSqlEmpty(n, env, mapper)
+	// node that can only be evaluated to a value or error
+	case ast.NodeTypeHas, ast.NodeTypeGetTag, ast.NodeTypeLike, ast.NodeTypeIfThenElse, ast.NodeTypeIs, ast.NodeTypeIsIn, ast.NodeTypeExtensionCall, ast.NodeTypeNegate, ast.NodeTypeRecord, ast.NodeTypeSet:
+		value, err = toValue(n, env)
+		return true, value, nil, err
 	default:
 		return false, nil, nil, fmt.Errorf("unsupported node type: %T", n)
 	}
@@ -262,7 +246,7 @@ func toSqlBinary(n ast.IsNode, env eval.Env, mapper FieldMapper) (isValue bool, 
 		}
 		if _, ok := leftValue.(types.EntityUID); ok {
 			if _, lok := right.(ast.NodeTypeVariable); lok {
-				sql := Expr("? "+op+" ?.id", leftSqlizer, valToArg)
+				sql := Expr("? "+op+" ?.id", valToArg, rightSqlizer)
 				return false, nil, sql, nil
 			}
 			sql := Expr("? "+op+" ?", valToArg, rightSqlizer)
@@ -303,11 +287,10 @@ func toAccess(n ast.NodeTypeAccess, env eval.Env, mapper FieldMapper) (isValue b
 		}
 		return true, val, nil, nil
 	}
-	sql, args, err := sqlizer.ToSql()
+	sql, args, err := ConcatExpr(sqlizer, ".", n.Value).ToSql()
 	if err != nil {
 		return false, nil, nil, err
 	}
-	sql = fmt.Sprintf("%s.%s", sql, n.Value)
 	if mapper != nil {
 		field, ok := mapper.Map(sql)
 		if ok {
@@ -317,12 +300,12 @@ func toAccess(n ast.NodeTypeAccess, env eval.Env, mapper FieldMapper) (isValue b
 	return false, nil, newPart(sql, args...), nil
 }
 
-func toValueOrError(n ast.IsNode, env eval.Env, mapper FieldMapper) (isValue bool, value types.Value, sqlizer Sqlizer, err error) {
+func toValue(n ast.IsNode, env eval.Env) (value types.Value, err error) {
 	val, err := eval.EvalNode(n, env)
 	if err != nil {
-		return false, nil, nil, err
+		return nil, err
 	}
-	return true, val, nil, nil
+	return val, nil
 }
 
 func toSqlNot(n ast.NodeTypeNot, env eval.Env, mapper FieldMapper) (isValue bool, value types.Value, sqlizer Sqlizer, err error) {
@@ -376,7 +359,6 @@ func toSqlIn(n ast.NodeTypeIn, env eval.Env, mapper FieldMapper) (isValue bool, 
 		return false, nil, nil, err
 	}
 
-	//两边都是值
 	if leftIsValue && rightIsValue {
 		val, err := eval.EvalNode(ast.Value(leftValue).In(ast.Value(rightValue)).AsIsNode(), env)
 		if err != nil {
@@ -384,7 +366,6 @@ func toSqlIn(n ast.NodeTypeIn, env eval.Env, mapper FieldMapper) (isValue bool, 
 		}
 		return true, val, nil, nil
 	}
-	//右边是值, 并且只能是set
 	if !rightIsValue {
 		return false, nil, nil, fmt.Errorf("right side of IN must be a set, not %T", rightSqlizer)
 	}
